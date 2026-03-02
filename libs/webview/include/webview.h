@@ -2885,6 +2885,17 @@ public:
       return S_OK;
     }
 
+    // Set WebView2 default background to transparent first (before any other use of controller).
+    ICoreWebView2Controller2 *controller2 = nullptr;
+    if (SUCCEEDED(controller->QueryInterface(IID_ICoreWebView2Controller2,
+                                             reinterpret_cast<void **>(&controller2))) &&
+        controller2) {
+      COREWEBVIEW2_COLOR color = {};
+      color.A = 0;
+      controller2->put_DefaultBackgroundColor(color);
+      controller2->Release();
+    }
+
     ICoreWebView2 *webview;
     ::EventRegistrationToken token;
     controller->get_CoreWebView2(&webview);
@@ -3002,6 +3013,7 @@ public:
       wc.hInstance = hInstance;
       wc.lpszClassName = L"webview";
       wc.hIcon = icon;
+      wc.hbrBackground = (HBRUSH)GetStockObject(NULL_BRUSH);
       wc.lpfnWndProc = (WNDPROC)(+[](HWND hwnd, UINT msg, WPARAM wp,
                                      LPARAM lp) -> LRESULT {
         win32_edge_engine *w{};
@@ -3023,6 +3035,8 @@ public:
         }
 
         switch (msg) {
+        case WM_ERASEBKGND:
+          return 1;
         case WM_SIZE:
           w->resize_widget();
           break;
@@ -3067,9 +3081,17 @@ public:
         }
         case WM_ACTIVATE:
           if (LOWORD(wp) != WA_INACTIVE) {
+            w->ensure_transparent_background();
             w->focus_webview();
           }
           break;
+        case WM_NCHITTEST: {
+          LRESULT hit = DefWindowProcW(hwnd, msg, wp, lp);
+          if (hit == HTTRANSPARENT) {
+            return HTCLIENT;
+          }
+          return hit;
+        }
         default:
           return DefWindowProcW(hwnd, msg, wp, lp);
         }
@@ -3077,10 +3099,30 @@ public:
       });
       RegisterClassExW(&wc);
 
-      CreateWindowW(L"webview", L"", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
-                    CW_USEDEFAULT, 0, 0, nullptr, nullptr, hInstance, this);
+#ifndef WS_EX_NOREDIRECTIONBITMAP
+#define WS_EX_NOREDIRECTIONBITMAP 0x00200000
+#endif
+      // WS_EX_LAYERED: transparent pixels; WS_EX_NOREDIRECTIONBITMAP: no DWM redirection surface (can help transparency).
+      CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP, L"webview",
+                      L"", WS_POPUP, CW_USEDEFAULT, CW_USEDEFAULT, 0,
+                      0, nullptr, nullptr, hInstance, this);
       if (m_window == nullptr) {
         return;
+      }
+      // SetLayeredWindowAttributes(m_window, 0, 255, LWA_ALPHA);
+      {
+        struct local_margins {
+          int cxLeftWidth, cxRightWidth, cyTopHeight, cyBottomHeight;
+        };
+        using dwm_extend_t = HRESULT(WINAPI *)(HWND, const local_margins *);
+        if (HMODULE hDwm = LoadLibraryW(L"dwmapi.dll")) {
+          if (auto pDwmExtend =
+                  reinterpret_cast<dwm_extend_t>(GetProcAddress(hDwm, "DwmExtendFrameIntoClientArea"))) {
+            local_margins m = {-1, -1, -1, -1};
+            pDwmExtend(m_window, &m);
+          }
+          FreeLibrary(hDwm);
+        }
       }
       on_window_created();
 
@@ -3100,6 +3142,7 @@ public:
     widget_wc.cbSize = sizeof(WNDCLASSEX);
     widget_wc.hInstance = hInstance;
     widget_wc.lpszClassName = L"webview_widget";
+    widget_wc.hbrBackground = (HBRUSH)GetStockObject(NULL_BRUSH);
     widget_wc.lpfnWndProc = (WNDPROC)(+[](HWND hwnd, UINT msg, WPARAM wp,
                                           LPARAM lp) -> LRESULT {
       win32_edge_engine *w{};
@@ -3119,6 +3162,8 @@ public:
       }
 
       switch (msg) {
+      case WM_ERASEBKGND:
+        return 1;
       case WM_SIZE:
         w->resize_webview();
         break;
@@ -3312,6 +3357,8 @@ public:
 
 private:
   bool embed(HWND wnd, bool debug, msg_cb_t cb) {
+    SetEnvironmentVariableW(L"WEBVIEW2_DEFAULT_BACKGROUND_COLOR", L"0x00000000");
+
     std::atomic_flag flag = ATOMIC_FLAG_INIT;
     flag.test_and_set();
 
@@ -3379,9 +3426,12 @@ private:
     }
     init("window.external={invoke:s=>window.chrome.webview.postMessage(s)}");
     resize_webview();
+    ensure_transparent_background();
     m_controller->put_IsVisible(TRUE);
     ShowWindow(m_widget, SW_SHOW);
     UpdateWindow(m_widget);
+    InvalidateRect(m_window, nullptr, TRUE);
+    UpdateWindow(m_window);
     if (m_owns_window) {
       focus_webview();
     }
@@ -3410,6 +3460,20 @@ private:
   void focus_webview() {
     if (m_controller) {
       m_controller->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+    }
+  }
+
+  // Re-apply transparent background (fixes black background after minimize/restore).
+  void ensure_transparent_background() {
+    if (!m_controller) return;
+    ICoreWebView2Controller2 *c2 = nullptr;
+    if (SUCCEEDED(m_controller->QueryInterface(IID_ICoreWebView2Controller2,
+                                                reinterpret_cast<void **>(&c2))) &&
+        c2) {
+      COREWEBVIEW2_COLOR color = {};
+      color.A = 0;
+      c2->put_DefaultBackgroundColor(color);
+      c2->Release();
     }
   }
 
