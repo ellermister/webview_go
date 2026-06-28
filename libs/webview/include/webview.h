@@ -2211,6 +2211,7 @@ using GetDpiForWindow_t = UINT(WINAPI *)(HWND);
 using EnableNonClientDpiScaling_t = BOOL(WINAPI *)(HWND);
 using AdjustWindowRectExForDpi_t = BOOL(WINAPI *)(LPRECT, DWORD, BOOL, DWORD,
                                                   UINT);
+using GetSystemMetricsForDpi_t = int(WINAPI *)(int, UINT);
 using GetWindowDpiAwarenessContext_t = DPI_AWARENESS_CONTEXT(WINAPI *)(HWND);
 using AreDpiAwarenessContextsEqual_t = BOOL(WINAPI *)(DPI_AWARENESS_CONTEXT,
                                                       DPI_AWARENESS_CONTEXT);
@@ -2234,6 +2235,8 @@ constexpr auto EnableNonClientDpiScaling =
     library_symbol<EnableNonClientDpiScaling_t>("EnableNonClientDpiScaling");
 constexpr auto AdjustWindowRectExForDpi =
     library_symbol<AdjustWindowRectExForDpi_t>("AdjustWindowRectExForDpi");
+constexpr auto GetSystemMetricsForDpi =
+    library_symbol<GetSystemMetricsForDpi_t>("GetSystemMetricsForDpi");
 constexpr auto GetWindowDpiAwarenessContext =
     library_symbol<GetWindowDpiAwarenessContext_t>(
         "GetWindowDpiAwarenessContext");
@@ -2465,6 +2468,67 @@ inline SIZE make_window_frame_size(HWND window, int width, int height,
   auto frame_width = r.right - r.left;
   auto frame_height = r.bottom - r.top;
   return {frame_width, frame_height};
+}
+
+inline int get_system_metric_for_dpi(int metric, int dpi) {
+  auto user32 = native_library(L"user32.dll");
+  if (auto fn = user32.get(user32_symbols::GetSystemMetricsForDpi)) {
+    return fn(metric, static_cast<UINT>(dpi));
+  }
+  return GetSystemMetrics(metric);
+}
+
+inline int get_resize_border_thickness(HWND window) {
+  auto dpi = get_window_dpi(window);
+  auto frame = get_system_metric_for_dpi(SM_CXFRAME, dpi);
+  auto padded = get_system_metric_for_dpi(SM_CXPADDEDBORDER, dpi);
+  auto minimum = scale_value_for_dpi(6, get_default_window_dpi(), dpi);
+  return std::max(frame + padded, minimum);
+}
+
+inline LRESULT hit_test_window_border(HWND window, LPARAM lp) {
+  if (IsZoomed(window)) {
+    return HTCLIENT;
+  }
+
+  RECT r{};
+  if (!GetWindowRect(window, &r)) {
+    return HTCLIENT;
+  }
+
+  auto x = static_cast<int>(static_cast<short>(LOWORD(lp)));
+  auto y = static_cast<int>(static_cast<short>(HIWORD(lp)));
+  auto border = get_resize_border_thickness(window);
+  auto left = x >= r.left && x < r.left + border;
+  auto right = x < r.right && x >= r.right - border;
+  auto top = y >= r.top && y < r.top + border;
+  auto bottom = y < r.bottom && y >= r.bottom - border;
+
+  if (top && left) {
+    return HTTOPLEFT;
+  }
+  if (top && right) {
+    return HTTOPRIGHT;
+  }
+  if (bottom && left) {
+    return HTBOTTOMLEFT;
+  }
+  if (bottom && right) {
+    return HTBOTTOMRIGHT;
+  }
+  if (left) {
+    return HTLEFT;
+  }
+  if (right) {
+    return HTRIGHT;
+  }
+  if (top) {
+    return HTTOP;
+  }
+  if (bottom) {
+    return HTBOTTOM;
+  }
+  return HTCLIENT;
 }
 
 inline bool is_dark_theme_enabled() {
@@ -3035,6 +3099,10 @@ public:
         }
 
         switch (msg) {
+        case WM_NCCALCSIZE:
+          // The window keeps resize/maximize styles for native behavior, but
+          // all drawable area belongs to WebView so no system frame is visible.
+          return 0;
         case WM_ERASEBKGND:
           return 1;
         case WM_SIZE:
@@ -3050,6 +3118,17 @@ public:
           break;
         case WM_GETMINMAXINFO: {
           auto lpmmi = (LPMINMAXINFO)lp;
+          MONITORINFO mi{};
+          mi.cbSize = sizeof(mi);
+          auto monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+          if (monitor && GetMonitorInfoW(monitor, &mi)) {
+            auto work = mi.rcWork;
+            auto monitor_rect = mi.rcMonitor;
+            lpmmi->ptMaxPosition.x = work.left - monitor_rect.left;
+            lpmmi->ptMaxPosition.y = work.top - monitor_rect.top;
+            lpmmi->ptMaxSize.x = work.right - work.left;
+            lpmmi->ptMaxSize.y = work.bottom - work.top;
+          }
           if (w->m_maxsz.x > 0 && w->m_maxsz.y > 0) {
             lpmmi->ptMaxSize = w->m_maxsz;
             lpmmi->ptMaxTrackSize = w->m_maxsz;
@@ -3058,6 +3137,22 @@ public:
             lpmmi->ptMinTrackSize = w->m_minsz;
           }
         } break;
+        case WM_SYSCOMMAND: {
+          auto cmd = wp & 0xfff0;
+          if (cmd == SC_MINIMIZE) {
+            ShowWindow(hwnd, SW_MINIMIZE);
+            return 0;
+          }
+          if (cmd == SC_RESTORE) {
+            ShowWindow(hwnd, SW_RESTORE);
+            return 0;
+          }
+          if (cmd == SC_MAXIMIZE) {
+            ShowWindow(hwnd, SW_MAXIMIZE);
+            return 0;
+          }
+          return DefWindowProcW(hwnd, msg, wp, lp);
+        }
         case 0x02E4 /*WM_GETDPISCALEDSIZE*/: {
           auto dpi = static_cast<int>(wp);
           auto *size{reinterpret_cast<SIZE *>(lp)};
@@ -3086,11 +3181,12 @@ public:
           }
           break;
         case WM_NCHITTEST: {
-          LRESULT hit = DefWindowProcW(hwnd, msg, wp, lp);
-          if (hit == HTTRANSPARENT) {
-            return HTCLIENT;
+          auto border_hit = hit_test_window_border(hwnd, lp);
+          if (border_hit != HTCLIENT) {
+            return border_hit;
           }
-          return hit;
+          LRESULT hit = DefWindowProcW(hwnd, msg, wp, lp);
+          return hit == HTTRANSPARENT ? HTCLIENT : hit;
         }
         default:
           return DefWindowProcW(hwnd, msg, wp, lp);
@@ -3164,6 +3260,15 @@ public:
       switch (msg) {
       case WM_ERASEBKGND:
         return 1;
+      case WM_NCHITTEST: {
+        if (auto parent = GetParent(hwnd)) {
+          auto border_hit = hit_test_window_border(parent, lp);
+          if (border_hit != HTCLIENT) {
+            return border_hit;
+          }
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
+      }
       case WM_SIZE:
         w->resize_webview();
         break;
@@ -3313,7 +3418,7 @@ public:
     if (hints == WEBVIEW_HINT_FIXED) {
       style &= ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
     } else {
-      style |= (WS_THICKFRAME | WS_MAXIMIZEBOX);
+      style |= (WS_THICKFRAME | WS_MAXIMIZEBOX | WS_MINIMIZEBOX | WS_SYSMENU);
     }
     SetWindowLong(m_window, GWL_STYLE, style);
 
@@ -3328,9 +3433,7 @@ public:
       m_dpi = dpi;
       auto scaled_size =
           scale_size(width, height, get_default_window_dpi(), dpi);
-      auto frame_size =
-          make_window_frame_size(m_window, scaled_size.cx, scaled_size.cy, dpi);
-      SetWindowPos(m_window, nullptr, 0, 0, frame_size.cx, frame_size.cy,
+      SetWindowPos(m_window, nullptr, 0, 0, scaled_size.cx, scaled_size.cy,
                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE |
                        SWP_FRAMECHANGED);
     }
