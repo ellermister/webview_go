@@ -888,6 +888,30 @@ private:
   mod_handle_t m_handle{};
 };
 
+// Injected on non-debug builds (macOS/Linux); Windows uses native interception.
+inline std::string browser_shortcut_block_script() {
+  return R"js((function () {
+  if (window.__WEBVIEW_BLOCK_BROWSER_KEYS__) return;
+  window.__WEBVIEW_BLOCK_BROWSER_KEYS__ = true;
+  function shouldBlock(e) {
+    var mod = e.metaKey || e.ctrlKey;
+    if (!mod) return e.key === 'F5' || e.key === 'F12';
+    var k = (e.key || '').toLowerCase();
+    var s = e.shiftKey;
+    var a = e.altKey;
+    if (a && 'icuj'.indexOf(k) >= 0) return true;
+    if (s && 'grijcw'.indexOf(k) >= 0) return true;
+    return 'fpgrhjunwtld0'.indexOf(k) >= 0 || k === '+' || k === '-' || k === '=';
+  }
+  window.addEventListener('keydown', function (e) {
+    if (shouldBlock(e)) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+    }
+  }, true);
+})();)js";
+}
+
 class engine_base {
 public:
   virtual ~engine_base() = default;
@@ -1282,6 +1306,8 @@ public:
       webkit_settings_set_enable_write_console_messages_to_stdout(settings,
                                                                   true);
       webkit_settings_set_enable_developer_extras(settings, true);
+    } else {
+      init(browser_shortcut_block_script());
     }
 
     if (m_owns_window) {
@@ -1818,6 +1844,63 @@ private:
     }
     return objc::msg_send<id>((id)cls, "new"_sel);
   }
+  static id create_webkit_ui_delegate_restricted() {
+    objc::autoreleasepool arp;
+    constexpr auto class_name = "WebviewWKUIDelegateRestricted";
+    auto cls = objc_lookUpClass(class_name);
+    if (!cls) {
+      cls = objc_allocateClassPair((Class) "NSObject"_cls, class_name, 0);
+      class_addProtocol(cls, objc_getProtocol("WKUIDelegate"));
+      class_addMethod(
+          cls,
+          "webView:runOpenPanelWithParameters:initiatedByFrame:completionHandler:"_sel,
+          (IMP)(+[](id, SEL, id, id parameters, id, id completion_handler) {
+            auto allows_multiple_selection =
+                objc::msg_send<BOOL>(parameters, "allowsMultipleSelection"_sel);
+            auto allows_directories =
+                objc::msg_send<BOOL>(parameters, "allowsDirectories"_sel);
+
+            auto panel = objc::msg_send<id>("NSOpenPanel"_cls, "openPanel"_sel);
+            objc::msg_send<void>(panel, "setCanChooseFiles:"_sel, YES);
+            objc::msg_send<void>(panel, "setCanChooseDirectories:"_sel,
+                                 allows_directories);
+            objc::msg_send<void>(panel, "setAllowsMultipleSelection:"_sel,
+                                 allows_multiple_selection);
+            auto modal_response =
+                objc::msg_send<NSModalResponse>(panel, "runModal"_sel);
+
+            id urls = modal_response == NSModalResponseOK
+                          ? objc::msg_send<id>(panel, "URLs"_sel)
+                          : nullptr;
+
+            auto sig = objc::msg_send<id>(
+                "NSMethodSignature"_cls, "signatureWithObjCTypes:"_sel, "v@?@");
+            auto invocation = objc::msg_send<id>(
+                "NSInvocation"_cls, "invocationWithMethodSignature:"_sel, sig);
+            objc::msg_send<void>(invocation, "setTarget:"_sel,
+                                 completion_handler);
+            objc::msg_send<void>(invocation, "setArgument:atIndex:"_sel, &urls,
+                                 1);
+            objc::msg_send<void>(invocation, "invoke"_sel);
+          }),
+          "v@:@@@@");
+      class_addMethod(
+          cls,
+          "webView:contextMenuConfigurationForElement:completionHandler:"_sel,
+          (IMP)(+[](id, SEL, id /*webview*/, id /*element*/,
+                    id completion_handler) {
+            using wk_context_menu_cb = void (^)(id);
+            auto block =
+                reinterpret_cast<wk_context_menu_cb>(completion_handler);
+            if (block) {
+              block(nullptr);
+            }
+          }),
+          "v@:@@@");
+      objc_registerClassPair(cls);
+    }
+    return objc::msg_send<id>((id)cls, "new"_sel);
+  }
   static id create_window_delegate() {
     objc::autoreleasepool arp;
     constexpr auto class_name = "WebviewNSWindowDelegate";
@@ -1956,10 +2039,16 @@ private:
     objc::msg_send<id>(preferences, "setValue:forKey:"_sel, yes_value,
                        "DOMPasteAllowed"_str);
 
-    auto ui_delegate = objc::autoreleased(create_webkit_ui_delegate());
+    auto ui_delegate = objc::autoreleased(m_debug
+                                              ? create_webkit_ui_delegate()
+                                              : create_webkit_ui_delegate_restricted());
     objc::msg_send<void>(m_webview, "initWithFrame:configuration:"_sel,
                          CGRectMake(0, 0, 0, 0), config);
     objc::msg_send<void>(m_webview, "setUIDelegate:"_sel, ui_delegate);
+
+    if (!m_debug) {
+      init(browser_shortcut_block_script());
+    }
 
     if (m_debug) {
       // Explicitly make WKWebView inspectable via Safari on OS versions that
@@ -3526,6 +3615,21 @@ private:
     res = settings->put_IsStatusBarEnabled(FALSE);
     if (res != S_OK) {
       return false;
+    }
+    if (!debug) {
+      res = settings->put_AreDefaultContextMenusEnabled(FALSE);
+      if (res != S_OK) {
+        return false;
+      }
+      ICoreWebView2Settings3 *settings3 = nullptr;
+      if (SUCCEEDED(settings->QueryInterface(
+              IID_ICoreWebView2Settings3,
+              reinterpret_cast<void **>(&settings3))) &&
+          settings3) {
+        settings3->put_AreBrowserAcceleratorKeysEnabled(FALSE);
+        settings3->Release();
+      }
+      init(browser_shortcut_block_script());
     }
     init("window.external={invoke:s=>window.chrome.webview.postMessage(s)}");
     resize_webview();
