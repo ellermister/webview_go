@@ -888,12 +888,24 @@ private:
   mod_handle_t m_handle{};
 };
 
-// Injected on non-debug builds (macOS/Linux); Windows uses native interception.
+// Injected on non-debug builds. Only preventDefault — do not stopImmediatePropagation,
+// so application handlers (web/src/composables/useAppHotkeys.ts) still run.
 inline std::string browser_shortcut_block_script() {
   return R"js((function () {
   if (window.__WEBVIEW_BLOCK_BROWSER_KEYS__) return;
   window.__WEBVIEW_BLOCK_BROWSER_KEYS__ = true;
+  function isAppShortcut(e) {
+    if (e.altKey) return false;
+    var k = (e.key || '').toLowerCase();
+    if (!e.shiftKey) {
+      if (e.ctrlKey && 'tnokw'.indexOf(k) >= 0) return true;
+      if (e.metaKey && k === 'w') return true;
+    }
+    if (e.ctrlKey && !e.metaKey && e.code === 'Tab') return true;
+    return false;
+  }
   function shouldBlock(e) {
+    if (isAppShortcut(e)) return false;
     var mod = e.metaKey || e.ctrlKey;
     if (!mod) return e.key === 'F5' || e.key === 'F12';
     var k = (e.key || '').toLowerCase();
@@ -906,7 +918,6 @@ inline std::string browser_shortcut_block_script() {
   window.addEventListener('keydown', function (e) {
     if (shouldBlock(e)) {
       e.preventDefault();
-      e.stopImmediatePropagation();
     }
   }, true);
 })();)js";
@@ -3629,6 +3640,7 @@ private:
         settings3->put_AreBrowserAcceleratorKeysEnabled(FALSE);
         settings3->Release();
       }
+      // Keys still reach the page; F5/F12 etc. are blocked by the script below.
       init(browser_shortcut_block_script());
     }
     init("window.external={invoke:s=>window.chrome.webview.postMessage(s)}");
