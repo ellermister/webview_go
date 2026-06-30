@@ -923,6 +923,24 @@ inline std::string browser_shortcut_block_script() {
 })();)js";
 }
 
+// 禁止 Ctrl/⌘+滚轮及触控板捏合缩放（各平台均注入）。
+inline std::string browser_zoom_block_script() {
+  return R"js((function () {
+  if (window.__WEBVIEW_BLOCK_ZOOM__) return;
+  window.__WEBVIEW_BLOCK_ZOOM__ = true;
+  function blockZoomWheel(e) {
+    if (e.ctrlKey || e.metaKey) {
+      e.preventDefault();
+    }
+  }
+  window.addEventListener('wheel', blockZoomWheel, { passive: false, capture: true });
+  document.addEventListener('wheel', blockZoomWheel, { passive: false, capture: true });
+  ['gesturestart', 'gesturechange', 'gestureend'].forEach(function (type) {
+    document.addEventListener(type, function (e) { e.preventDefault(); }, { passive: false, capture: true });
+  });
+})();)js";
+}
+
 class engine_base {
 public:
   virtual ~engine_base() = default;
@@ -1320,6 +1338,7 @@ public:
     } else {
       init(browser_shortcut_block_script());
     }
+    init(browser_zoom_block_script());
 
     if (m_owns_window) {
       gtk_widget_grab_focus(GTK_WIDGET(m_webview));
@@ -2060,6 +2079,7 @@ private:
     if (!m_debug) {
       init(browser_shortcut_block_script());
     }
+    init(browser_zoom_block_script());
 
     if (m_debug) {
       // Explicitly make WKWebView inspectable via Safari on OS versions that
@@ -3428,12 +3448,7 @@ public:
     CreateWindowExW(0, L"webview_message", nullptr, 0, 0, 0, 0, 0, HWND_MESSAGE,
                     nullptr, hInstance, this);
 
-    if (m_owns_window) {
-      ShowWindow(m_window, SW_SHOW);
-      UpdateWindow(m_window);
-      SetFocus(m_window);
-    }
-
+    // 不在此处 ShowWindow：由宿主在首屏就绪后显示，避免白屏闪烁。
     auto cb =
         std::bind(&win32_edge_engine::on_message, this, std::placeholders::_1);
 
@@ -3627,6 +3642,11 @@ private:
     if (res != S_OK) {
       return false;
     }
+    res = settings->put_IsZoomControlEnabled(FALSE);
+    if (res != S_OK) {
+      return false;
+    }
+    m_controller->put_ZoomFactor(1.0);
     if (!debug) {
       res = settings->put_AreDefaultContextMenusEnabled(FALSE);
       if (res != S_OK) {
@@ -3643,14 +3663,16 @@ private:
       // Keys still reach the page; F5/F12 etc. are blocked by the script below.
       init(browser_shortcut_block_script());
     }
+    init(browser_zoom_block_script());
     init("window.external={invoke:s=>window.chrome.webview.postMessage(s)}");
     resize_webview();
     ensure_transparent_background();
     m_controller->put_IsVisible(TRUE);
-    ShowWindow(m_widget, SW_SHOW);
-    UpdateWindow(m_widget);
-    InvalidateRect(m_window, nullptr, TRUE);
-    UpdateWindow(m_window);
+    if (!m_owns_window) {
+      ShowWindow(m_widget, SW_SHOW);
+      UpdateWindow(m_widget);
+    }
+    // 自有窗口：保持隐藏，待宿主 ShowWindow(m_window) 后再呈现。
     if (m_owns_window) {
       focus_webview();
     }
